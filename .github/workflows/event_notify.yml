@@ -1,0 +1,47 @@
+name: Anime Event Notification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7 12,20 * * *'
+      timezone: 'Asia/Tokyo'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: anime-event-notification
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Fetch and notify
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python event_bot.py
+      - name: Commit notification history (even after partial delivery)
+        if: always()
+        run: |
+          if [ -f sent_articles.json ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add sent_articles.json
+            if ! git diff --cached --quiet; then
+              git commit -m 'Update sent event articles'
+              git push
+            fi
+          fi
