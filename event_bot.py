@@ -50,8 +50,11 @@ def get_items():
         feed = feedparser.parse(response.content)
         if feed.bozo and not feed.entries:
             raise RuntimeError(f"RSS parsing failed: {url}: {feed.bozo_exception}")
-        if not feed.entries:
+               if not feed.entries:
             raise RuntimeError(f"RSS contains no entries: {url}")
+
+        print(f"RSS取得成功: {source} / 記事数: {len(feed.entries)}")
+
         for entry in feed.entries:
             title = re.sub(r"\s+", " ", entry.get("title", "")).strip()
             link = entry.get("link", "").strip()
