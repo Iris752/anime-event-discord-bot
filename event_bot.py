@@ -1,169 +1,160 @@
-"""RSS -> Discord anime event notifications. Python 3.11+."""
+"""Anime event news RSS -> Discord. Python 3.11+."""
 import json
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs, unquote
 
 import feedparser
 import requests
 
-FEEDS = {"アニメ！アニメ！": "https://animeanime.jp/rss/index.rdf"}
-STATE = Path("sent_articles.json")
+STATE = Path('sent_articles.json')
 MAX_POSTS = 12
-HISTORY_LIMIT = 3000
-# Require a specific real-world event signal, not generic "開催決定" alone.
-PATTERNS = {
-    "コラボカフェ": r"コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ",
-    "ポップアップ": r"ポップアップ(?:ストア|ショップ)?|POP[ -]?UP(?: STORE| SHOP)?|期間限定ショップ",
-    "展示会・原画展": r"原画展|展覧会|展示会|企画展|特別展|アニメ展",
-    "イベント": r"コラボイベント|ファンミーティング|トークショー|スタンプラリー|上映会|リアルイベント|アニメイベント|コラボ開催|コラボ企画",
+HISTORY_LIMIT = 5000
+FEEDS = {
+    'アニメ！アニメ！': 'https://animeanime.jp/rss/index.rdf',
+    'Googleニュース・コラボカフェ': 'https://news.google.com/rss/search?q=%E3%82%A2%E3%83%8B%E3%83%A1+%E3%82%B3%E3%83%A9%E3%83%9C%E3%82%AB%E3%83%95%E3%82%A7&hl=ja&gl=JP&ceid=JP:ja',
+    'Googleニュース・展示会': 'https://news.google.com/rss/search?q=%E3%82%A2%E3%83%8B%E3%83%A1+%E5%8E%9F%E7%94%BB%E5%B1%95+OR+%E5%B1%95%E7%A4%BA%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja',
+    'Googleニュース・ポップアップ': 'https://news.google.com/rss/search?q=%E3%82%A2%E3%83%8B%E3%83%A1+%E3%83%9D%E3%83%83%E3%83%97%E3%82%A2%E3%83%83%E3%83%97&hl=ja&gl=JP&ceid=JP:ja',
 }
+CATEGORIES = [
+    ('☕ コラボカフェ', 0xE6A23C, r'コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ|コラボレストラン|カフェコラボ'),
+    ('🛍️ ポップアップ', 0x9B59B6, r'ポップアップ|POP[ -]?UP|期間限定ショップ|コラボショップ'),
+    ('🖼️ 展示会・原画展', 0x3498DB, r'原画展|展覧会|展示会|企画展|特別展|アニメ展'),
+    ('🎪 イベント', 0x2ECC71, r'コラボイベント|ファンミーティング|トークショー|スタンプラリー|上映会|リアルイベント|アニメイベント|コラボ開催|コラボ企画|先行上映|アニメフェス'),
+]
+EXCLUDE = re.compile(r'開催中止|開催延期|払い戻し|返金|お詫び|訂正のお知らせ', re.I)
+HEADERS = {'User-Agent': 'AnimeEventDiscordBot/2.0 (public RSS reader)'}
 
 
 def load_state():
     if not STATE.exists():
         return None
-    data = json.loads(STATE.read_text(encoding="utf-8"))
+    data = json.loads(STATE.read_text(encoding='utf-8'))
     if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
-        raise ValueError("sent_articles.json must be a JSON string array")
+        raise ValueError('sent_articles.json must be a JSON string array')
     return data
 
 
 def save_state(history):
-    STATE.write_text(json.dumps(history[-HISTORY_LIMIT:], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    STATE.write_text(json.dumps(history[-HISTORY_LIMIT:], ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
-def valid_link(link):
-    parsed = urlsplit(link)
-    return parsed.scheme == "https" and parsed.hostname in {"animeanime.jp", "www.animeanime.jp"}
+def is_safe_link(link):
+    p = urlsplit(link)
+    return p.scheme == 'https' and bool(p.hostname) and not p.username and not p.password
 
 
+def published_iso(entry):
+    for attr in ('published_parsed', 'updated_parsed'):
+        value = entry.get(attr)
+        if value:
+            return datetime(*value[:6], tzinfo=timezone.utc).isoformat()
+    return None
 
-def get_items():
-    found = {}
 
+def collect():
+    items = {}
+    successful = 0
     for source, url in FEEDS.items():
-        response = requests.get(
-            url,
-            timeout=25,
-            headers={
-                "User-Agent": "AnimeEventDiscordBot/1.0 (RSS reader)"
-            }
-        )
-        response.raise_for_status()
-
-        feed = feedparser.parse(response.content)
-
-        if feed.bozo and not feed.entries:
-            raise RuntimeError(
-                f"RSS parsing failed: {url}: {feed.bozo_exception}"
-            )
-
-        if not feed.entries:
-            raise RuntimeError(f"RSS contains no entries: {url}")
-
-        print(
-            f"RSS取得成功: {source} / "
-            f"記事数: {len(feed.entries)}"
-        )
-
-        for entry in feed.entries:
-            title = re.sub(
-                r"\s+", " ", entry.get("title", "")
-            ).strip()
-            link = entry.get("link", "").strip()
-
-            if not title or not valid_link(link):
-                continue
-
-            category = next(
-                (
-                    name
-                    for name, pattern in PATTERNS.items()
-                    if re.search(pattern, title, re.I)
-                ),
-                None
-            )
-
-            if category:
-                found[link] = {
-                    "title": title,
-                    "link": link,
-                    "source": source,
-                    "category": category
-                }
-
-    return list(found.values())
+        try:
+            response = requests.get(url, timeout=25, headers=HEADERS)
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
+            if not feed.entries:
+                raise RuntimeError('RSS contains no entries')
+            successful += 1
+            print(f'RSS OK: {source}: total={len(feed.entries)}', flush=True)
+            accepted = 0
+            for entry in feed.entries:
+                title = re.sub(r'\s+', ' ', entry.get('title', '')).strip()
+                link = entry.get('link', '').strip()
+                if not title or not is_safe_link(link) or EXCLUDE.search(title):
+                    continue
+                match = next(((label, color) for label, color, pattern in CATEGORIES if re.search(pattern, title, re.I)), None)
+                if not match:
+                    continue
+                # Google News may repeat the same underlying story across queries.
+                # Use stable URL key; do not pretend to fully deduplicate syndication.
+                key = link.split('#', 1)[0]
+                if key not in items:
+                    items[key] = dict(key=key, title=title, link=link, source=source, category=match[0], color=match[1], published=published_iso(entry))
+                    accepted += 1
+            print(f'RSS matched: {source}: {accepted}', flush=True)
+        except (requests.RequestException, RuntimeError) as exc:
+            print(f'WARNING: RSS unavailable: {source}: {exc}', file=sys.stderr, flush=True)
+    if successful == 0:
+        raise RuntimeError('All RSS sources failed; state was not changed')
+    return list(items.values())
 
 
-
-
-
-def post(item, webhook):
-    payload = {
-        "username": "アニメコラボ・イベント速報",
-        "allowed_mentions": {"parse": []},
-        "embeds": [{
-            "title": item["title"][:256],
-            "url": item["link"],
-            "description": f'🎪 **{item["category"]}** の新着記事',
-            "color": 5793266,
-            "footer": {"text": f'情報元：{item["source"]}｜記事公開情報（開催日とは異なります）'},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }],
+def send(webhook, item):
+    embed = {
+        'title': item['title'][:256],
+        'url': item['link'],
+        'description': f"**{item['category']}**\n[記事を読む]({item['link']})",
+        'color': item['color'],
+        'fields': [{'name': '📰 情報源', 'value': item['source'], 'inline': True}],
+        'footer': {'text': '記事公開情報です。開催日時・会場はリンク先でご確認ください'},
     }
-    for attempt in range(5):
+    if item['published']:
+        embed['timestamp'] = item['published']
+    payload = {'username': 'アニメコラボ・イベント速報', 'allowed_mentions': {'parse': []}, 'embeds': [embed]}
+    for _ in range(5):
         response = requests.post(webhook, json=payload, timeout=25)
         if response.status_code in (200, 204):
             return
         if response.status_code == 429:
             try:
-                delay = float(response.json().get("retry_after", 3))
+                wait = float(response.json().get('retry_after', 3))
             except (ValueError, TypeError):
-                delay = 3
-            time.sleep(max(1, min(delay, 60)))
+                wait = 3
+            time.sleep(max(1, min(wait, 60)))
             continue
         response.raise_for_status()
-    raise RuntimeError("Discord rate limit retries exhausted")
+    raise RuntimeError('Discord rate limit retries exhausted')
 
 
 def main():
-    dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
-    webhook = os.getenv("DISCORD_WEBHOOK_URL", "")
-    if not dry_run and not webhook.startswith("https://discord.com/api/webhooks/"):
-        raise ValueError("Set DISCORD_WEBHOOK_URL as a GitHub Actions secret")
-    items = get_items()  # Fail closed: never initialize state if RSS fetch fails.
+    dry_run = os.getenv('DRY_RUN', 'false').lower() == 'true'
+    webhook = os.getenv('DISCORD_WEBHOOK_URL', '')
+    if not dry_run and not webhook.startswith('https://discord.com/api/webhooks/'):
+        raise ValueError('Set DISCORD_WEBHOOK_URL in GitHub Actions secrets')
+    items = collect()
     history = load_state()
-    print(f"Matched RSS articles: {len(items)}")
+    print(f'Matched RSS articles: {len(items)}', flush=True)
     if history is None:
-        # Baseline all currently visible items; don't send historical alerts.
         if not dry_run:
-            save_state([x["link"] for x in items])
-        print("First run: baseline initialized, no Discord messages sent")
+            save_state([x['key'] for x in items])
+        print('First run: baseline initialized; no Discord messages sent', flush=True)
+        return
+    if os.getenv('BASELINE_NOW', 'false').lower() == 'true':
+        save_state(history + [x['key'] for x in items if x['key'] not in set(history)])
+        print('Migration baseline updated; no Discord messages sent', flush=True)
         return
     known = set(history)
-    unseen = [x for x in reversed(items) if x["link"] not in known]
-    print(f"New matched articles: {len(unseen)}")
+    unseen = [x for x in reversed(items) if x['key'] not in known]
+    print(f'New matched articles: {len(unseen)}', flush=True)
     for item in unseen[:MAX_POSTS]:
         if dry_run:
-            print(f'[DRY RUN] {item["category"]}: {item["title"]} | {item["link"]}')
+            print(f"[DRY RUN] {item['category']}: {item['title']}", flush=True)
         else:
-            post(item, webhook)
-            history.append(item["link"])
-            save_state(history)  # Save only after successful delivery.
-            print(f'Sent: {item["title"]}')
+            send(webhook, item)
+            history.append(item['key'])
+            save_state(history)
+            print(f"Sent: {item['title']}", flush=True)
             time.sleep(1)
     if len(unseen) > MAX_POSTS:
-        print(f"Remaining articles for next run: {len(unseen) - MAX_POSTS}")
+        print(f'Pending for next run: {len(unseen) - MAX_POSTS}', flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f'ERROR: {exc}', file=sys.stderr)
         sys.exit(1)
