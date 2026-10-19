@@ -42,28 +42,65 @@ def valid_link(link):
     return parsed.scheme == "https" and parsed.hostname in {"animeanime.jp", "www.animeanime.jp"}
 
 
+
 def get_items():
     found = {}
+
     for source, url in FEEDS.items():
-        response = requests.get(url, timeout=25, headers={"User-Agent": "AnimeEventDiscordBot/1.0 (RSS reader)"})
+        response = requests.get(
+            url,
+            timeout=25,
+            headers={
+                "User-Agent": "AnimeEventDiscordBot/1.0 (RSS reader)"
+            }
+        )
         response.raise_for_status()
+
         feed = feedparser.parse(response.content)
+
         if feed.bozo and not feed.entries:
-            raise RuntimeError(f"RSS parsing failed: {url}: {feed.bozo_exception}")
-               if not feed.entries:
+            raise RuntimeError(
+                f"RSS parsing failed: {url}: {feed.bozo_exception}"
+            )
+
+        if not feed.entries:
             raise RuntimeError(f"RSS contains no entries: {url}")
 
-        print(f"RSS取得成功: {source} / 記事数: {len(feed.entries)}")
+        print(
+            f"RSS取得成功: {source} / "
+            f"記事数: {len(feed.entries)}"
+        )
 
         for entry in feed.entries:
-            title = re.sub(r"\s+", " ", entry.get("title", "")).strip()
+            title = re.sub(
+                r"\s+", " ", entry.get("title", "")
+            ).strip()
             link = entry.get("link", "").strip()
+
             if not title or not valid_link(link):
                 continue
-            category = next((name for name, pattern in PATTERNS.items() if re.search(pattern, title, re.I)), None)
+
+            category = next(
+                (
+                    name
+                    for name, pattern in PATTERNS.items()
+                    if re.search(pattern, title, re.I)
+                ),
+                None
+            )
+
             if category:
-                found[link] = {"title": title, "link": link, "source": source, "category": category}
+                found[link] = {
+                    "title": title,
+                    "link": link,
+                    "source": source,
+                    "category": category
+                }
+
     return list(found.values())
+
+
+
 
 
 def post(item, webhook):
