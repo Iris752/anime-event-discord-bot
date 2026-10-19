@@ -1,3 +1,4 @@
+
 name: Anime Event Notification
 
 on:
@@ -17,22 +18,52 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Test Discord webhook
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          url = os.environ["DISCORD_WEBHOOK_URL"]
+          payload = {
+              "username": "アニメコラボ・イベント速報",
+              "content": "✅ 【テスト通知】アニメイベントBOTのWebhook接続に成功しました！",
+              "allowed_mentions": {"parse": []}
+          }
+
+          response = requests.post(
+              url,
+              json=payload,
+              timeout=20
+          )
+          response.raise_for_status()
+          print("Discord webhook test succeeded")
+          PY
+
       - name: Fetch and notify
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python event_bot.py
+
       - name: Commit notification history (even after partial delivery)
         if: always()
         run: |
