@@ -1,5 +1,6 @@
 """Anime event news RSS -> Discord. Python 3.11+."""
 import json
+import html
 import os
 import re
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import feedparser
+from bs4 import BeautifulSoup
 import requests
 
 STATE = Path('sent_articles.json')
@@ -22,6 +24,10 @@ SOURCE_STATE = Path('active_sources.json')
 # The original v1 source is already active. New sources are baselined on their first successful read.
 ORIGINAL_SOURCES = {'アニメ！アニメ！'}
 MAX_ARTICLE_AGE_HOURS = 72
+EVENT_END_GRACE_DAYS = 14
+JST = timezone(timedelta(hours=9))
+# Strict mode: do not post if an event end date cannot be identified reliably.
+REQUIRE_EVENT_END_DATE = True
 
 CATEGORIES = [
     ('☕ コラボカフェ', 0xE6A23C, r'コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ|コラボレストラン|カフェコラボ|カフェ(?:が|を|で)?(?:開催|オープン)'),
@@ -72,6 +78,65 @@ def save_sources(sources):
     SOURCE_STATE.write_text(json.dumps(sorted(sources), ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
+# Only interpret explicit event period/end-date wording; never infer an end date
+# from the article publication date or an unrelated date in the page.
+DATE = r'(?P<year>20\d{2})年\s*(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
+MD = r'(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
+RANGE = re.compile(
+    r'(?:開催期間|会期|実施期間|販売期間|開催日程|開催日時)[：:\s]{0,12}'
+    + DATE + r'.{0,55}?(?:～|〜|~|から|－|–|―|\-|より).{0,12}?(?:(?P<endyear>20\d{2})年\s*)?'
+    + r'(?P<endmonth>1[0-2]|0?[1-9])月\s*(?P<endday>3[01]|[12]\d|0?[1-9])日', re.I)
+ENDS = re.compile(r'(?:終了日|最終日|会期終了|開催終了)[：：\s]*' + DATE, re.I)
+UNTIL = re.compile(r'(?:開催|実施|会期|販売|営業|オープン|コラボ).{0,35}?(?:まで|終了予定)', re.I)
+END_WITH_UNTIL = re.compile(DATE + r'.{0,8}?(?:まで|をもって終了)', re.I)
+
+
+def parse_event_end(text):
+    """Return event end date only for an explicit, year-grounded expression."""
+    candidates = []
+    for match in RANGE.finditer(text):
+        year = int(match['endyear'] or match['year'])
+        # A Dec->Jan range without an end year rolls into the next year.
+        if not match['endyear'] and int(match['endmonth']) < int(match['month']):
+            year += 1
+        try:
+            candidates.append(datetime(year, int(match['endmonth']), int(match['endday']), tzinfo=JST))
+        except ValueError:
+            pass
+    for match in ENDS.finditer(text):
+        try:
+            candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST))
+        except ValueError:
+            pass
+    # Explicit event-context ending, e.g. コラボカフェは2026年10月30日まで
+    for match in END_WITH_UNTIL.finditer(text):
+        context = text[max(0, match.start()-65):match.start()]
+        if re.search(r'開催|会期|コラボ|カフェ|ショップ|展示|イベント|販売|営業', context):
+            try:
+                candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST))
+            except ValueError:
+                pass
+    return max(candidates).date() if candidates else None
+
+
+def event_text(entry, link):
+    """Use RSS summary and the article body; page failure falls back to RSS."""
+    summary = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text(' ', strip=True)
+    pieces = [summary]
+    try:
+        response = requests.get(link, timeout=12, headers=HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+            tag.decompose()
+        article = soup.find('article') or soup.find('main')
+        if article:
+            pieces.append(article.get_text(' ', strip=True)[:15000])
+    except requests.RequestException as exc:
+        print(f'WARNING: article fetch failed: {link}: {exc}', file=sys.stderr, flush=True)
+    return re.sub(r'\s+', ' ', ' '.join(pieces))
+
+
 def collect():
     items = {}
     successful_sources = set()
@@ -85,6 +150,8 @@ def collect():
                 raise RuntimeError('RSS contains no entries')
             successful_sources.add(source)
             accepted = 0
+            skipped_old = 0
+            skipped_unknown = 0
             for entry in feed.entries:
                 title = re.sub(r'\s+', ' ', entry.get('title', '')).strip()
                 link = entry.get('link', '').strip()
@@ -106,12 +173,21 @@ def collect():
                     published_dt = datetime.fromisoformat(published)
                     if published_dt < now - timedelta(hours=MAX_ARTICLE_AGE_HOURS):
                         continue
+                content = event_text(entry, link)
+                event_end = parse_event_end(content)
+                if event_end is None:
+                    skipped_unknown += 1
+                    if REQUIRE_EVENT_END_DATE:
+                        continue
+                elif event_end < (now.astimezone(JST).date() - timedelta(days=EVENT_END_GRACE_DAYS)):
+                    skipped_old += 1
+                    continue
                 key = link.split('#', 1)[0]
                 if key not in items:
                     items[key] = dict(key=key, title=title, link=link, source=source,
-                                      category=match[0], color=match[1], published=published)
+                                      category=match[0], color=match[1], published=published, event_end=str(event_end) if event_end else None)
                     accepted += 1
-            print(f'RSS OK: {source}: total={len(feed.entries)} matched={accepted}', flush=True)
+            print(f'RSS OK: {source}: total={len(feed.entries)} matched={accepted} old_event_excluded={skipped_old} unknown_date_excluded={skipped_unknown}', flush=True)
         except (requests.RequestException, RuntimeError) as exc:
             print(f'WARNING: RSS unavailable: {source}: {exc}', file=sys.stderr, flush=True)
     if not successful_sources:
@@ -128,6 +204,8 @@ def send(webhook, item):
         'fields': [{'name': '📰 情報源', 'value': item['source'], 'inline': True}],
         'footer': {'text': '記事公開情報です。開催日時・会場はリンク先でご確認ください'},
     }
+    if item.get('event_end'):
+        embed['fields'].append({'name': '📅 確認できた終了日', 'value': item['event_end'], 'inline': True})
     if item['published']:
         embed['timestamp'] = item['published']
     payload = {'username': 'アニメコラボ・イベント速報', 'allowed_mentions': {'parse': []}, 'embeds': [embed]}
