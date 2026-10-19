@@ -64,10 +64,10 @@ jobs:
       - name: Commit notification history
         if: always()
         run: |
-          if [ -f sent_articles.json ]; then
+          if [ -f sent_articles.json ] || [ -f active_sources.json ]; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add sent_articles.json
+            git add -f sent_articles.json active_sources.json 2>/dev/null || git add sent_articles.json
             if ! git diff --cached --quiet; then
               git commit -m 'Update sent event articles'
               git pull --rebase origin main
