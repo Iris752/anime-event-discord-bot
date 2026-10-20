@@ -1,33 +1,32 @@
-"""Anime event news RSS -> Discord. Python 3.11+."""
-import json
+"""Anime event news RSS -> Discord. Python 3.11+. v2.3"""
 import html
+import json
 import os
 import re
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import feedparser
-from bs4 import BeautifulSoup
 import requests
+from bs4 import BeautifulSoup
 
 STATE = Path('sent_articles.json')
+SOURCE_STATE = Path('active_sources.json')
 MAX_POSTS = 12
 HISTORY_LIMIT = 5000
 FEEDS = {
     'アニメ！アニメ！': 'https://animeanime.jp/rss/index.rdf',
     'コミックナタリー': 'https://natalie.mu/comic/feed/news',
 }
-SOURCE_STATE = Path('active_sources.json')
-# The original v1 source is already active. New sources are baselined on their first successful read.
 ORIGINAL_SOURCES = {'アニメ！アニメ！'}
 MAX_ARTICLE_AGE_HOURS = 72
 EVENT_END_GRACE_DAYS = 14
 JST = timezone(timedelta(hours=9))
-# Strict mode: do not post if an event end date cannot be identified reliably.
-REQUIRE_EVENT_END_DATE = True
+HEADERS = {'User-Agent': 'AnimeEventDiscordBot/2.3 (public RSS reader)'}
+ARTICLE_HOSTS = {'animeanime.jp', 'www.animeanime.jp', 'natalie.mu'}
 
 CATEGORIES = [
     ('☕ コラボカフェ', 0xE6A23C, r'コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ|コラボレストラン|カフェコラボ|カフェ(?:が|を|で)?(?:開催|オープン)'),
@@ -36,7 +35,17 @@ CATEGORIES = [
     ('🎪 イベント', 0x2ECC71, r'コラボイベント|ファンミーティング|トークショー|スタンプラリー|上映会|リアルイベント|アニメイベント|コラボ開催|コラボ企画|先行上映|アニメフェス|コラボフェア'),
 ]
 EXCLUDE = re.compile(r'開催中止|開催延期|払い戻し|返金|お詫び|訂正のお知らせ', re.I)
-HEADERS = {'User-Agent': 'AnimeEventDiscordBot/2.1 (public RSS reader)'}
+# A headline must contain an event category, OR a summary must have both a
+# category and an event-action cue. This avoids posting unrelated anime news.
+EVENT_ACTION = re.compile(r'開催|オープン|出店|登場|実施|販売|会場|会期|展開|実施決定|開催決定')
+
+DATE = r'(?P<year>20\d{2})年\s*(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
+RANGE = re.compile(
+    r'(?:開催期間|会期|実施期間|販売期間|開催日程|開催日時)[：:\s]{0,12}'
+    + DATE + r'.{0,55}?(?:～|〜|~|から|－|–|―|\-|より).{0,12}?(?:(?P<endyear>20\d{2})年\s*)?'
+    + r'(?P<endmonth>1[0-2]|0?[1-9])月\s*(?P<endday>3[01]|[12]\d|0?[1-9])日', re.I)
+ENDS = re.compile(r'(?:終了日|最終日|会期終了|開催終了)[：:\s]*' + DATE, re.I)
+END_WITH_UNTIL = re.compile(DATE + r'.{0,8}?(?:まで|をもって終了)', re.I)
 
 
 def load_state():
@@ -52,19 +61,6 @@ def save_state(history):
     STATE.write_text(json.dumps(history[-HISTORY_LIMIT:], ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
-def is_safe_link(link):
-    p = urlsplit(link)
-    return p.scheme == 'https' and bool(p.hostname) and not p.username and not p.password
-
-
-def published_iso(entry):
-    for attr in ('published_parsed', 'updated_parsed'):
-        value = entry.get(attr)
-        if value:
-            return datetime(*value[:6], tzinfo=timezone.utc).isoformat()
-    return None
-
-
 def load_sources():
     if not SOURCE_STATE.exists():
         return set(ORIGINAL_SOURCES)
@@ -78,60 +74,60 @@ def save_sources(sources):
     SOURCE_STATE.write_text(json.dumps(sorted(sources), ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 
-# Only interpret explicit event period/end-date wording; never infer an end date
-# from the article publication date or an unrelated date in the page.
-DATE = r'(?P<year>20\d{2})年\s*(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
-MD = r'(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
-RANGE = re.compile(
-    r'(?:開催期間|会期|実施期間|販売期間|開催日程|開催日時)[：:\s]{0,12}'
-    + DATE + r'.{0,55}?(?:～|〜|~|から|－|–|―|\-|より).{0,12}?(?:(?P<endyear>20\d{2})年\s*)?'
-    + r'(?P<endmonth>1[0-2]|0?[1-9])月\s*(?P<endday>3[01]|[12]\d|0?[1-9])日', re.I)
-ENDS = re.compile(r'(?:終了日|最終日|会期終了|開催終了)[：：\s]*' + DATE, re.I)
-UNTIL = re.compile(r'(?:開催|実施|会期|販売|営業|オープン|コラボ).{0,35}?(?:まで|終了予定)', re.I)
-END_WITH_UNTIL = re.compile(DATE + r'.{0,8}?(?:まで|をもって終了)', re.I)
+def is_safe_link(link):
+    p = urlsplit(link)
+    return p.scheme == 'https' and p.hostname in ARTICLE_HOSTS and not p.username and not p.password
+
+
+def published_iso(entry):
+    for attr in ('published_parsed', 'updated_parsed'):
+        value = entry.get(attr)
+        if value:
+            return datetime(*value[:6], tzinfo=timezone.utc).isoformat()
+    return None
 
 
 def parse_event_end(text):
-    """Return event end date only for an explicit, year-grounded expression."""
+    """Extract only explicit year-grounded end dates; never use publication date."""
     candidates = []
     for match in RANGE.finditer(text):
         year = int(match['endyear'] or match['year'])
-        # A Dec->Jan range without an end year rolls into the next year.
         if not match['endyear'] and int(match['endmonth']) < int(match['month']):
             year += 1
         try:
-            candidates.append(datetime(year, int(match['endmonth']), int(match['endday']), tzinfo=JST))
+            candidates.append(datetime(year, int(match['endmonth']), int(match['endday']), tzinfo=JST).date())
         except ValueError:
             pass
     for match in ENDS.finditer(text):
         try:
-            candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST))
+            candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST).date())
         except ValueError:
             pass
-    # Explicit event-context ending, e.g. コラボカフェは2026年10月30日まで
     for match in END_WITH_UNTIL.finditer(text):
         context = text[max(0, match.start()-65):match.start()]
         if re.search(r'開催|会期|コラボ|カフェ|ショップ|展示|イベント|販売|営業', context):
             try:
-                candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST))
+                candidates.append(datetime(int(match['year']), int(match['month']), int(match['day']), tzinfo=JST).date())
             except ValueError:
                 pass
-    return max(candidates).date() if candidates else None
+    return max(candidates) if candidates else None
 
 
 def event_text(entry, link):
-    """Use RSS summary and the article body; page failure falls back to RSS."""
     summary = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text(' ', strip=True)
     pieces = [summary]
     try:
-        response = requests.get(link, timeout=12, headers=HEADERS)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
-            tag.decompose()
-        article = soup.find('article') or soup.find('main')
-        if article:
-            pieces.append(article.get_text(' ', strip=True)[:15000])
+        # Avoid following redirects to unrelated hosts.
+        response = requests.get(link, timeout=12, headers=HEADERS, allow_redirects=False)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+                tag.decompose()
+            article = soup.find('article') or soup.find('main')
+            if article:
+                pieces.append(article.get_text(' ', strip=True)[:15000])
+        else:
+            print(f'WARNING: article HTTP {response.status_code}: {link}', flush=True)
     except requests.RequestException as exc:
         print(f'WARNING: article fetch failed: {link}: {exc}', file=sys.stderr, flush=True)
     return re.sub(r'\s+', ' ', ' '.join(pieces))
@@ -149,45 +145,50 @@ def collect():
             if not feed.entries:
                 raise RuntimeError('RSS contains no entries')
             successful_sources.add(source)
-            accepted = 0
-            skipped_old = 0
-            skipped_unknown = 0
+            accepted = skipped_old = unknown_included = skipped_stale = 0
             for entry in feed.entries:
-                title = re.sub(r'\s+', ' ', entry.get('title', '')).strip()
+                title = re.sub(r'\s+', ' ', html.unescape(entry.get('title', ''))).strip()
                 link = entry.get('link', '').strip()
                 if not title or not is_safe_link(link) or EXCLUDE.search(title):
                     continue
-                summary = re.sub(r'<[^>]+>', ' ', entry.get('summary', ''))
-                summary = re.sub(r'\s+', ' ', summary).strip()[:600]
-                # Prefer explicit event terms in the headline; only use the summary
-                # when it also contains an event-action cue.
+                summary = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text(' ', strip=True)[:1000]
                 match = next(((label, color) for label, color, pattern in CATEGORIES
                               if re.search(pattern, title, re.I)), None)
-                if not match and re.search(r'開催|オープン|出店|登場|実施|販売|会場|会期|展開', summary):
+                if not match and EVENT_ACTION.search(summary):
                     match = next(((label, color) for label, color, pattern in CATEGORIES
                                   if re.search(pattern, summary, re.I)), None)
                 if not match:
                     continue
                 published = published_iso(entry)
-                if published:
-                    published_dt = datetime.fromisoformat(published)
-                    if published_dt < now - timedelta(hours=MAX_ARTICLE_AGE_HOURS):
-                        continue
+                # Unknown or old publication dates must not bypass the safety
+                # window when the event end date is unknown.
+                published_dt = datetime.fromisoformat(published) if published else None
+                if published_dt and published_dt > now + timedelta(hours=1):
+                    skipped_stale += 1
+                    continue
+                if published_dt and published_dt < now - timedelta(hours=MAX_ARTICLE_AGE_HOURS):
+                    skipped_stale += 1
+                    continue
                 content = event_text(entry, link)
                 event_end = parse_event_end(content)
-                if event_end is None:
-                    skipped_unknown += 1
-                    if REQUIRE_EVENT_END_DATE:
-                        continue
-                elif event_end < (now.astimezone(JST).date() - timedelta(days=EVENT_END_GRACE_DAYS)):
+                if event_end is not None and event_end <= (now.astimezone(JST).date() - timedelta(days=EVENT_END_GRACE_DAYS)):
                     skipped_old += 1
                     continue
+                if event_end is None:
+                    if published_dt is None:
+                        # No trustworthy freshness signal: avoid historic floods.
+                        skipped_stale += 1
+                        continue
+                    unknown_included += 1
                 key = link.split('#', 1)[0]
                 if key not in items:
                     items[key] = dict(key=key, title=title, link=link, source=source,
-                                      category=match[0], color=match[1], published=published, event_end=str(event_end) if event_end else None)
+                                      category=match[0], color=match[1], published=published,
+                                      event_end=str(event_end) if event_end else None)
                     accepted += 1
-            print(f'RSS OK: {source}: total={len(feed.entries)} matched={accepted} old_event_excluded={skipped_old} unknown_date_excluded={skipped_unknown}', flush=True)
+            print(f'RSS OK: {source}: total={len(feed.entries)} matched={accepted} '
+                  f'old_event_excluded={skipped_old} unknown_date_included={unknown_included} '
+                  f'stale_or_undated_excluded={skipped_stale}', flush=True)
         except (requests.RequestException, RuntimeError) as exc:
             print(f'WARNING: RSS unavailable: {source}: {exc}', file=sys.stderr, flush=True)
     if not successful_sources:
@@ -206,9 +207,12 @@ def send(webhook, item):
     }
     if item.get('event_end'):
         embed['fields'].append({'name': '📅 確認できた終了日', 'value': item['event_end'], 'inline': True})
+    else:
+        embed['fields'].append({'name': '📅 終了日', 'value': '未確認（記事本文をご確認ください）', 'inline': True})
     if item['published']:
         embed['timestamp'] = item['published']
-    payload = {'username': 'アニメコラボ・イベント速報', 'allowed_mentions': {'parse': []}, 'embeds': [embed]}
+    payload = {'username': 'アニメコラボ・イベント速報',
+               'allowed_mentions': {'parse': []}, 'embeds': [embed]}
     for _ in range(5):
         response = requests.post(webhook, json=payload, timeout=25)
         if response.status_code in (200, 204):
@@ -245,8 +249,6 @@ def main():
             save_sources(active_sources | successful_sources)
         print('Migration baseline updated; no Discord messages sent', flush=True)
         return
-    # A newly added source is automatically baselined when it first works.
-    # This also protects against sources recovering from an earlier outage.
     new_sources = successful_sources - active_sources
     baseline_keys = [x['key'] for x in items if x['source'] in new_sources]
     if new_sources:
