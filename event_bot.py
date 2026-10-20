@@ -1,4 +1,4 @@
-"""Anime event news RSS -> Discord. Python 3.11+. v2.3"""
+"""Anime event news RSS -> Discord. Python 3.11+. v2.4"""
 import html
 import json
 import os
@@ -20,24 +20,27 @@ HISTORY_LIMIT = 5000
 FEEDS = {
     'アニメ！アニメ！': 'https://animeanime.jp/rss/index.rdf',
     'コミックナタリー': 'https://natalie.mu/comic/feed/news',
+    'テレビ東京アニメ': 'https://www.tv-tokyo.co.jp/contents/anime/topics/index.xml',
 }
 ORIGINAL_SOURCES = {'アニメ！アニメ！'}
 MAX_ARTICLE_AGE_HOURS = 72
 EVENT_END_GRACE_DAYS = 14
 JST = timezone(timedelta(hours=9))
-HEADERS = {'User-Agent': 'AnimeEventDiscordBot/2.3 (public RSS reader)'}
-ARTICLE_HOSTS = {'animeanime.jp', 'www.animeanime.jp', 'natalie.mu'}
+HEADERS = {'User-Agent': 'AnimeEventDiscordBot/2.4 (public RSS reader)'}
+ARTICLE_HOSTS = {'animeanime.jp', 'www.animeanime.jp', 'natalie.mu', 'www.tv-tokyo.co.jp'}
 
 CATEGORIES = [
-    ('☕ コラボカフェ', 0xE6A23C, r'コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ|コラボレストラン|カフェコラボ|カフェ(?:が|を|で)?(?:開催|オープン)'),
-    ('🛍️ ポップアップ', 0x9B59B6, r'ポップアップ|POP[ -]?UP|期間限定ショップ|コラボショップ|期間限定ストア'),
-    ('🖼️ 展示会・原画展', 0x3498DB, r'原画展|展覧会|展示会|企画展|特別展|アニメ展|作品展'),
-    ('🎪 イベント', 0x2ECC71, r'コラボイベント|ファンミーティング|トークショー|スタンプラリー|上映会|リアルイベント|アニメイベント|コラボ開催|コラボ企画|先行上映|アニメフェス|コラボフェア'),
+    ('☕ コラボカフェ', 0xE6A23C, r'コラボカフェ|コラボ喫茶|コラボメニュー|テーマカフェ|コラボレストラン|コラボ喫茶店|コラボドリンク|カフェコラボ|カフェ(?:が|を|で)?(?:開催|オープン)'),
+    ('🛍️ ポップアップ', 0x9B59B6, r'ポップアップ|POP[ -]?UP|期間限定ショップ|コラボショップ|期間限定ストア|ポップアップストア|POPUP|催事ショップ'),
+    ('🖼️ 展示会・原画展', 0x3498DB, r'原画展|展覧会|展示会|企画展|特別展|アニメ展|作品展|原作展|イラスト展'),
+    ('🎪 イベント', 0x2ECC71, r'コラボイベント|ファンミーティング|トークショー|スタンプラリー|上映会|リアルイベント|アニメイベント|コラボ開催|コラボ企画|先行上映|アニメフェス|コラボフェア|謎解きイベント|コラボキャンペーン|アニメコラボ'),
 ]
 EXCLUDE = re.compile(r'開催中止|開催延期|払い戻し|返金|お詫び|訂正のお知らせ', re.I)
 # A headline must contain an event category, OR a summary must have both a
 # category and an event-action cue. This avoids posting unrelated anime news.
-EVENT_ACTION = re.compile(r'開催|オープン|出店|登場|実施|販売|会場|会期|展開|実施決定|開催決定')
+EVENT_ACTION = re.compile(r'開催|オープン|出店|登場|実施|販売|会場|会期|展開|実施決定|開催決定|実施中|開催中|スタート|出展|期間限定')
+# Require concrete event context when the category appears only in a summary.
+SUMMARY_EVENT_CONTEXT = re.compile(r'コラボ|イベント|カフェ|ショップ|展示|フェア|ポップアップ|上映|スタンプラリー')
 
 DATE = r'(?P<year>20\d{2})年\s*(?P<month>1[0-2]|0?[1-9])月\s*(?P<day>3[01]|[12]\d|0?[1-9])日'
 RANGE = re.compile(
@@ -145,19 +148,21 @@ def collect():
             if not feed.entries:
                 raise RuntimeError('RSS contains no entries')
             successful_sources.add(source)
-            accepted = skipped_old = unknown_included = skipped_stale = 0
+            accepted = skipped_old = unknown_included = skipped_stale = skipped_keyword = skipped_invalid = 0
             for entry in feed.entries:
                 title = re.sub(r'\s+', ' ', html.unescape(entry.get('title', ''))).strip()
                 link = entry.get('link', '').strip()
                 if not title or not is_safe_link(link) or EXCLUDE.search(title):
+                    skipped_invalid += 1
                     continue
                 summary = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text(' ', strip=True)[:1000]
                 match = next(((label, color) for label, color, pattern in CATEGORIES
                               if re.search(pattern, title, re.I)), None)
-                if not match and EVENT_ACTION.search(summary):
+                if not match and EVENT_ACTION.search(summary) and SUMMARY_EVENT_CONTEXT.search(summary):
                     match = next(((label, color) for label, color, pattern in CATEGORIES
                                   if re.search(pattern, summary, re.I)), None)
                 if not match:
+                    skipped_keyword += 1
                     continue
                 published = published_iso(entry)
                 # Unknown or old publication dates must not bypass the safety
@@ -188,7 +193,8 @@ def collect():
                     accepted += 1
             print(f'RSS OK: {source}: total={len(feed.entries)} matched={accepted} '
                   f'old_event_excluded={skipped_old} unknown_date_included={unknown_included} '
-                  f'stale_or_undated_excluded={skipped_stale}', flush=True)
+                  f'stale_or_undated_excluded={skipped_stale} '
+                  f'keyword_excluded={skipped_keyword} invalid_or_excluded={skipped_invalid}', flush=True)
         except (requests.RequestException, RuntimeError) as exc:
             print(f'WARNING: RSS unavailable: {source}: {exc}', file=sys.stderr, flush=True)
     if not successful_sources:
